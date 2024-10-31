@@ -737,6 +737,7 @@ set(SOURCES
         db/version_set.cc
         db/wal_edit.cc
         db/wal_manager.cc
+        db/wide_columns_c.cc
         db/wide/wide_column_serialization.cc
         db/wide/wide_columns.cc
         db/wide/wide_columns_helper.cc

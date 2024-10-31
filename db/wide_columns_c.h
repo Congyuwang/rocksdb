@@ -21,7 +21,7 @@ extern "C" {
 #include <stdbool.h>
 #include <stddef.h>
 
-#include <rocksdb/c.h>
+#include "rocksdb/c.h"
 
 /* Exported types */
 
