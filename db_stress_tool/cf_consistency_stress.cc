@@ -73,13 +73,13 @@ class CfConsistencyStressTest : public StressTest {
       status = db_->Write(write_opts, &batch);
     }
 
-    if (!status.ok()) {
+    if (status.ok()) {
+      auto num = static_cast<long>(rand_column_families.size());
+      thread->stats.AddBytesForWrites(num, (sz + 1) * num);
+    } else if (!IsErrorInjectedAndRetryable(status)) {
       fprintf(stderr, "multi put or merge error: %s\n",
               status.ToString().c_str());
       thread->stats.AddErrors(1);
-    } else {
-      auto num = static_cast<long>(rand_column_families.size());
-      thread->stats.AddBytesForWrites(num, (sz + 1) * num);
     }
 
     return status;
@@ -96,11 +96,11 @@ class CfConsistencyStressTest : public StressTest {
       batch.Delete(cfh, key);
     }
     Status s = db_->Write(write_opts, &batch);
-    if (!s.ok()) {
+    if (s.ok()) {
+      thread->stats.AddDeletes(static_cast<long>(rand_column_families.size()));
+    } else if (!IsErrorInjectedAndRetryable(s)) {
       fprintf(stderr, "multidel error: %s\n", s.ToString().c_str());
       thread->stats.AddErrors(1);
-    } else {
-      thread->stats.AddDeletes(static_cast<long>(rand_column_families.size()));
     }
     return s;
   }
@@ -125,12 +125,12 @@ class CfConsistencyStressTest : public StressTest {
       batch.DeleteRange(cfh, key, end_key);
     }
     Status s = db_->Write(write_opts, &batch);
-    if (!s.ok()) {
-      fprintf(stderr, "multi del range error: %s\n", s.ToString().c_str());
-      thread->stats.AddErrors(1);
-    } else {
+    if (s.ok()) {
       thread->stats.AddRangeDeletions(
           static_cast<long>(rand_column_families.size()));
+    } else if (!IsErrorInjectedAndRetryable(s)) {
+      fprintf(stderr, "multi del range error: %s\n", s.ToString().c_str());
+      thread->stats.AddErrors(1);
     }
     return s;
   }
@@ -170,6 +170,15 @@ class CfConsistencyStressTest : public StressTest {
       std::string value0;
       s = db_->Get(readoptionscopy, column_families_[rand_column_families[0]],
                    key, &value0);
+
+      // Temporarily disable error injection for verification
+      if (fault_fs_guard) {
+        fault_fs_guard->DisableThreadLocalErrorInjection(
+            FaultInjectionIOType::kRead);
+        fault_fs_guard->DisableThreadLocalErrorInjection(
+            FaultInjectionIOType::kMetadataRead);
+      }
+
       if (s.ok() || s.IsNotFound()) {
         bool found = s.ok();
         for (size_t i = 1; i < rand_column_families.size(); i++) {
@@ -214,6 +223,13 @@ class CfConsistencyStressTest : public StressTest {
         }
       }
 
+      //  Enable back error injection disabled for verification
+      if (fault_fs_guard) {
+        fault_fs_guard->EnableThreadLocalErrorInjection(
+            FaultInjectionIOType::kRead);
+        fault_fs_guard->EnableThreadLocalErrorInjection(
+            FaultInjectionIOType::kMetadataRead);
+      }
       db_->ReleaseSnapshot(snapshot);
     }
     if (!is_consistent) {
@@ -225,7 +241,7 @@ class CfConsistencyStressTest : public StressTest {
       thread->stats.AddGets(1, 1);
     } else if (s.IsNotFound()) {
       thread->stats.AddGets(1, 0);
-    } else {
+    } else if (!IsErrorInjectedAndRetryable(s)) {
       fprintf(stderr, "TestGet error: %s\n", s.ToString().c_str());
       thread->stats.AddErrors(1);
     }
@@ -261,7 +277,7 @@ class CfConsistencyStressTest : public StressTest {
       } else if (s.IsNotFound()) {
         // not found case
         thread->stats.AddGets(1, 0);
-      } else {
+      } else if (!IsErrorInjectedAndRetryable(s)) {
         // errors case
         fprintf(stderr, "MultiGet error: %s\n", s.ToString().c_str());
         thread->stats.AddErrors(1);
@@ -322,6 +338,14 @@ class CfConsistencyStressTest : public StressTest {
       s = db_->GetEntity(read_opts_copy,
                          column_families_[rand_column_families[0]], key,
                          &cmp_result);
+
+      //  Temporarily disable error injection for verification
+      if (fault_fs_guard) {
+        fault_fs_guard->DisableThreadLocalErrorInjection(
+            FaultInjectionIOType::kRead);
+        fault_fs_guard->DisableThreadLocalErrorInjection(
+            FaultInjectionIOType::kMetadataRead);
+      }
 
       if (s.ok() || s.IsNotFound()) {
         const bool cmp_found = s.ok();
@@ -458,6 +482,14 @@ class CfConsistencyStressTest : public StressTest {
           }
         }
       }
+
+      //  Enable back error injection disabled for verification
+      if (fault_fs_guard) {
+        fault_fs_guard->EnableThreadLocalErrorInjection(
+            FaultInjectionIOType::kRead);
+        fault_fs_guard->EnableThreadLocalErrorInjection(
+            FaultInjectionIOType::kMetadataRead);
+      }
     }
 
     if (!is_consistent) {
@@ -469,7 +501,7 @@ class CfConsistencyStressTest : public StressTest {
       thread->stats.AddGets(1, 1);
     } else if (s.IsNotFound()) {
       thread->stats.AddGets(1, 0);
-    } else {
+    } else if (!IsErrorInjectedAndRetryable(s)) {
       fprintf(stderr, "TestGetEntity error: %s\n", s.ToString().c_str());
       thread->stats.AddErrors(1);
     }
@@ -506,94 +538,223 @@ class CfConsistencyStressTest : public StressTest {
 
     const size_t num_keys = rand_keys.size();
 
-    for (size_t i = 0; i < num_keys; ++i) {
-      const std::string key = Key(rand_keys[i]);
+    if (FLAGS_use_attribute_group) {
+      // AttributeGroup MultiGetEntity verification
 
-      std::vector<Slice> key_slices(num_cfs, key);
-      std::vector<PinnableWideColumns> results(num_cfs);
-      std::vector<Status> statuses(num_cfs);
+      std::vector<PinnableAttributeGroups> results;
+      std::vector<Slice> key_slices;
+      std::vector<std::string> key_strs;
+      results.reserve(num_keys);
+      key_slices.reserve(num_keys);
+      key_strs.reserve(num_keys);
 
-      db_->MultiGetEntity(read_opts_copy, num_cfs, cfhs.data(),
-                          key_slices.data(), results.data(), statuses.data());
+      for (size_t i = 0; i < num_keys; ++i) {
+        key_strs.emplace_back(Key(rand_keys[i]));
+        key_slices.emplace_back(key_strs.back());
+        PinnableAttributeGroups attribute_groups;
+        for (auto* cfh : cfhs) {
+          attribute_groups.emplace_back(cfh);
+        }
+        results.emplace_back(std::move(attribute_groups));
+      }
+      db_->MultiGetEntity(read_opts_copy, num_keys, key_slices.data(),
+                          results.data());
 
       bool is_consistent = true;
 
-      for (size_t j = 0; j < num_cfs; ++j) {
-        const Status& s = statuses[j];
-        const Status& cmp_s = statuses[0];
-        const WideColumns& columns = results[j].columns();
-        const WideColumns& cmp_columns = results[0].columns();
+      for (size_t i = 0; i < num_keys; ++i) {
+        const auto& result = results[i];
+        const Status& cmp_s = result[0].status();
+        const WideColumns& cmp_columns = result[0].columns();
 
-        if (!s.ok() && !s.IsNotFound()) {
-          fprintf(stderr, "TestMultiGetEntity error: %s\n",
-                  s.ToString().c_str());
-          thread->stats.AddErrors(1);
-          break;
-        }
+        bool has_error = false;
 
-        assert(cmp_s.ok() || cmp_s.IsNotFound());
+        for (size_t j = 0; j < num_cfs; ++j) {
+          const Status& s = result[j].status();
+          const WideColumns& columns = result[j].columns();
+          if (!s.ok() && IsErrorInjectedAndRetryable(s)) {
+            break;
+          } else if (!s.ok() && !s.IsNotFound()) {
+            fprintf(stderr, "TestMultiGetEntity (AttributeGroup) error: %s\n",
+                    s.ToString().c_str());
+            thread->stats.AddErrors(1);
+            has_error = true;
+            break;
+          }
 
-        if (s.IsNotFound()) {
-          if (cmp_s.ok()) {
-            fprintf(
-                stderr,
-                "MultiGetEntity returns different results for key %s: CF %s "
-                "returns entity %s, CF %s returns not found\n",
-                StringToHex(key).c_str(), column_family_names_[0].c_str(),
-                WideColumnsToHex(cmp_columns).c_str(),
-                column_family_names_[j].c_str());
+          assert(cmp_s.ok() || cmp_s.IsNotFound());
+
+          if (s.IsNotFound()) {
+            if (cmp_s.ok()) {
+              fprintf(stderr,
+                      "MultiGetEntity (AttributeGroup) returns different "
+                      "results for key %s: CF %s "
+                      "returns entity %s, CF %s returns not found\n",
+                      key_slices[i].ToString(true).c_str(),
+                      column_family_names_[0].c_str(),
+                      WideColumnsToHex(cmp_columns).c_str(),
+                      column_family_names_[j].c_str());
+              is_consistent = false;
+              break;
+            }
+
+            continue;
+          }
+
+          assert(s.ok());
+          if (cmp_s.IsNotFound()) {
+            fprintf(stderr,
+                    "MultiGetEntity (AttributeGroup) returns different results "
+                    "for key %s: CF %s "
+                    "returns not found, CF %s returns entity %s\n",
+                    key_slices[i].ToString(true).c_str(),
+                    column_family_names_[0].c_str(),
+                    column_family_names_[j].c_str(),
+                    WideColumnsToHex(columns).c_str());
             is_consistent = false;
             break;
           }
 
-          continue;
-        }
+          if (columns != cmp_columns) {
+            fprintf(stderr,
+                    "MultiGetEntity (AttributeGroup) returns different results "
+                    "for key %s: CF %s "
+                    "returns entity %s, CF %s returns entity %s\n",
+                    key_slices[i].ToString(true).c_str(),
+                    column_family_names_[0].c_str(),
+                    WideColumnsToHex(cmp_columns).c_str(),
+                    column_family_names_[j].c_str(),
+                    WideColumnsToHex(columns).c_str());
+            is_consistent = false;
+            break;
+          }
 
-        assert(s.ok());
-        if (cmp_s.IsNotFound()) {
-          fprintf(stderr,
-                  "MultiGetEntity returns different results for key %s: CF %s "
-                  "returns not found, CF %s returns entity %s\n",
-                  StringToHex(key).c_str(), column_family_names_[0].c_str(),
-                  column_family_names_[j].c_str(),
-                  WideColumnsToHex(columns).c_str());
-          is_consistent = false;
-          break;
+          if (!VerifyWideColumns(columns)) {
+            fprintf(stderr,
+                    "MultiGetEntity (AttributeGroup) error: inconsistent "
+                    "columns for key %s, "
+                    "entity %s\n",
+                    key_slices[i].ToString(true).c_str(),
+                    WideColumnsToHex(columns).c_str());
+            is_consistent = false;
+            break;
+          }
         }
-
-        if (columns != cmp_columns) {
-          fprintf(stderr,
-                  "MultiGetEntity returns different results for key %s: CF %s "
-                  "returns entity %s, CF %s returns entity %s\n",
-                  StringToHex(key).c_str(), column_family_names_[0].c_str(),
-                  WideColumnsToHex(cmp_columns).c_str(),
-                  column_family_names_[j].c_str(),
-                  WideColumnsToHex(columns).c_str());
-          is_consistent = false;
+        if (has_error) {
           break;
-        }
-
-        if (!VerifyWideColumns(columns)) {
+        } else if (!is_consistent) {
           fprintf(stderr,
-                  "MultiGetEntity error: inconsistent columns for key %s, "
-                  "entity %s\n",
-                  StringToHex(key).c_str(), WideColumnsToHex(columns).c_str());
-          is_consistent = false;
+                  "TestMultiGetEntity (AttributeGroup) error: results are not "
+                  "consistent\n");
+          thread->stats.AddErrors(1);
+          // Fail fast to preserve the DB state.
+          thread->shared->SetVerificationFailure();
           break;
+        } else if (cmp_s.ok()) {
+          thread->stats.AddGets(1, 1);
+        } else if (cmp_s.IsNotFound()) {
+          thread->stats.AddGets(1, 0);
         }
       }
 
-      if (!is_consistent) {
-        fprintf(stderr,
-                "TestMultiGetEntity error: results are not consistent\n");
-        thread->stats.AddErrors(1);
-        // Fail fast to preserve the DB state.
-        thread->shared->SetVerificationFailure();
-        break;
-      } else if (statuses[0].ok()) {
-        thread->stats.AddGets(1, 1);
-      } else if (statuses[0].IsNotFound()) {
-        thread->stats.AddGets(1, 0);
+    } else {
+      // Non-AttributeGroup MultiGetEntity verification
+
+      for (size_t i = 0; i < num_keys; ++i) {
+        const std::string key = Key(rand_keys[i]);
+
+        std::vector<Slice> key_slices(num_cfs, key);
+        std::vector<PinnableWideColumns> results(num_cfs);
+        std::vector<Status> statuses(num_cfs);
+
+        db_->MultiGetEntity(read_opts_copy, num_cfs, cfhs.data(),
+                            key_slices.data(), results.data(), statuses.data());
+
+        bool is_consistent = true;
+
+        const Status& cmp_s = statuses[0];
+        const WideColumns& cmp_columns = results[0].columns();
+
+        for (size_t j = 0; j < num_cfs; ++j) {
+          const Status& s = statuses[j];
+          const WideColumns& columns = results[j].columns();
+
+          if (!s.ok() && IsErrorInjectedAndRetryable(s)) {
+            break;
+          } else if (!s.ok() && !s.IsNotFound()) {
+            fprintf(stderr, "TestMultiGetEntity error: %s\n",
+                    s.ToString().c_str());
+            thread->stats.AddErrors(1);
+            break;
+          }
+
+          assert(cmp_s.ok() || cmp_s.IsNotFound());
+
+          if (s.IsNotFound()) {
+            if (cmp_s.ok()) {
+              fprintf(
+                  stderr,
+                  "MultiGetEntity returns different results for key %s: CF %s "
+                  "returns entity %s, CF %s returns not found\n",
+                  StringToHex(key).c_str(), column_family_names_[0].c_str(),
+                  WideColumnsToHex(cmp_columns).c_str(),
+                  column_family_names_[j].c_str());
+              is_consistent = false;
+              break;
+            }
+
+            continue;
+          }
+
+          assert(s.ok());
+          if (cmp_s.IsNotFound()) {
+            fprintf(
+                stderr,
+                "MultiGetEntity returns different results for key %s: CF %s "
+                "returns not found, CF %s returns entity %s\n",
+                StringToHex(key).c_str(), column_family_names_[0].c_str(),
+                column_family_names_[j].c_str(),
+                WideColumnsToHex(columns).c_str());
+            is_consistent = false;
+            break;
+          }
+
+          if (columns != cmp_columns) {
+            fprintf(
+                stderr,
+                "MultiGetEntity returns different results for key %s: CF %s "
+                "returns entity %s, CF %s returns entity %s\n",
+                StringToHex(key).c_str(), column_family_names_[0].c_str(),
+                WideColumnsToHex(cmp_columns).c_str(),
+                column_family_names_[j].c_str(),
+                WideColumnsToHex(columns).c_str());
+            is_consistent = false;
+            break;
+          }
+
+          if (!VerifyWideColumns(columns)) {
+            fprintf(stderr,
+                    "MultiGetEntity error: inconsistent columns for key %s, "
+                    "entity %s\n",
+                    StringToHex(key).c_str(),
+                    WideColumnsToHex(columns).c_str());
+            is_consistent = false;
+            break;
+          }
+        }
+
+        if (!is_consistent) {
+          fprintf(stderr,
+                  "TestMultiGetEntity error: results are not consistent\n");
+          thread->stats.AddErrors(1);
+          // Fail fast to preserve the DB state.
+          thread->shared->SetVerificationFailure();
+          break;
+        } else if (statuses[0].ok()) {
+          thread->stats.AddGets(1, 1);
+        } else if (statuses[0].IsNotFound()) {
+          thread->stats.AddGets(1, 0);
+        }
       }
     }
   }
@@ -621,6 +782,10 @@ class CfConsistencyStressTest : public StressTest {
     if (GetNextPrefix(prefix, &upper_bound) && thread->rand.OneIn(2)) {
       ub_slice = Slice(upper_bound);
       ro_copy.iterate_upper_bound = &ub_slice;
+      if (FLAGS_use_sqfc_for_range_queries) {
+        ro_copy.table_filter =
+            sqfc_factory_->GetTableFilterForRangeQuery(prefix, ub_slice);
+      }
     }
 
     ColumnFamilyHandle* const cfh =
@@ -651,7 +816,7 @@ class CfConsistencyStressTest : public StressTest {
       s = iter->status();
     }
 
-    if (!s.ok()) {
+    if (!s.ok() && !IsErrorInjectedAndRetryable(s)) {
       fprintf(stderr, "TestPrefixScan error: %s\n", s.ToString().c_str());
       thread->stats.AddErrors(1);
 
